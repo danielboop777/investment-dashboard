@@ -1,10 +1,13 @@
 name: Update Investment Dashboard (TW Close)
 
 on:
-  schedule:
-    # Taiwan 18:00 = UTC 10:00
-    - cron: "0 10 * * 1-5"
   workflow_dispatch:
+  schedule:
+    # 台灣時間 18:10 = UTC 10:10（你可自行調整）
+    - cron: "10 10 * * 1-5"
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -24,23 +27,62 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Update TW stock close prices
+      # ✅✅✅ 這段就是你要的：從 GitHub Secrets 還原 Excel
+      - name: Restore Excel files from GitHub Secrets
+        env:
+          TX_XLSX_B64: ${{ secrets.TX_XLSX_B64 }}
+          FF_XLSX_B64: ${{ secrets.FF_XLSX_B64 }}
+        run: |
+          python - <<'PY'
+          import os, base64, sys
+
+          def write_b64(env_key, out_path):
+              b64 = os.environ.get(env_key, "")
+              if not b64.strip():
+                  print(f"[ERROR] Missing secret: {env_key}")
+                  sys.exit(1)
+              data = base64.b64decode(b64)
+              with open(out_path, "wb") as f:
+                  f.write(data)
+              print(f"[OK] Wrote {out_path} ({len(data):,} bytes)")
+
+          write_b64("TX_XLSX_B64", "transactions.xlsx")
+          write_b64("FF_XLSX_B64", "Funds Flow.xlsx")
+          PY
+
+      - name: Verify restored files
+        run: |
+          ls -lah
+          test -f "transactions.xlsx"
+          test -f "Funds Flow.xlsx"
+
+      # ✅ 你的更新價格 script（你 repo 裡已 commit 的那支）
+      - name: Update TW Close prices
         run: |
           python update_prices_tw_close.py
 
-      - name: Build portfolio charts
+      # ✅ 產出兩個圖的 div/json
+      - name: Build Portfolio Value chart
         run: |
           python save_portfolio_chart_for_dashboard.py
+
+      - name: Build Dynamic Performance chart
+        run: |
           python save_dynamic_performance_chart_for_dashboard.py
 
+      # ✅ 產出 dashboard.html
       - name: Build dashboard HTML
         run: |
           python build_dashboard_v17_sticky_total_modal_label_analysis_updates.py
 
-      - name: Commit updated dashboard
+      # ✅ 把產出結果 commit 回 repo（讓 GitHub Pages 更新）
+      - name: Commit generated files
         run: |
-          git config --global user.name "github-actions"
-          git config --global user.email "github-actions@github.com"
-          git add prices_close.csv *.html *.json
-          git commit -m "Auto update dashboard (TW close)" || echo "No changes"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+          git status
+
+          git commit -m "Auto update dashboard" || echo "No changes to commit"
           git push
