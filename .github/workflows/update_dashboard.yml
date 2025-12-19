@@ -3,11 +3,15 @@ name: Update Investment Dashboard (TW Close)
 on:
   workflow_dispatch:
   schedule:
-    # 台灣時間 18:10 = UTC 10:10（你可自行調整）
+    # 台灣時間 18:10 = UTC 10:10
     - cron: "10 10 * * 1-5"
 
 permissions:
   contents: write
+
+concurrency:
+  group: investment-dashboard-update
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -16,6 +20,8 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -27,7 +33,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ✅✅✅ 這段就是你要的：從 GitHub Secrets 還原 Excel
+      # ✅ 從 GitHub Secrets 還原 Excel
       - name: Restore Excel files from GitHub Secrets
         env:
           TX_XLSX_B64: ${{ secrets.TX_XLSX_B64 }}
@@ -56,8 +62,10 @@ jobs:
           test -f "transactions.xlsx"
           test -f "Funds Flow.xlsx"
 
-      # ✅ 你的更新價格 script（你 repo 裡已 commit 的那支）
+      # ✅ 更新價格（FinMind token 可選）
       - name: Update TW Close prices
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
         run: |
           python update_prices_tw_close.py
 
@@ -75,7 +83,7 @@ jobs:
         run: |
           python build_dashboard_v17_sticky_total_modal_label_analysis_updates.py
 
-      # ✅ 把產出結果 commit 回 repo（讓 GitHub Pages 更新）
+      # ✅ Commit & push（push 前先 rebase）
       - name: Commit generated files
         run: |
           git config user.name "github-actions[bot]"
@@ -85,4 +93,6 @@ jobs:
           git status
 
           git commit -m "Auto update dashboard" || echo "No changes to commit"
+
+          git pull --rebase
           git push
