@@ -1,0 +1,46 @@
+name: Update Investment Dashboard (TW Close)
+
+on:
+  schedule:
+    # Taiwan 18:00 = UTC 10:00
+    - cron: "0 10 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Update TW stock close prices
+        run: |
+          python update_prices_tw_close.py
+
+      - name: Build portfolio charts
+        run: |
+          python save_portfolio_chart_for_dashboard.py
+          python save_dynamic_performance_chart_for_dashboard.py
+
+      - name: Build dashboard HTML
+        run: |
+          python build_dashboard_v17_sticky_total_modal_label_analysis_updates.py
+
+      - name: Commit updated dashboard
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          git add prices_close.csv *.html *.json
+          git commit -m "Auto update dashboard (TW close)" || echo "No changes"
+          git push
