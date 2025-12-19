@@ -1,251 +1,116 @@
 # update_prices_tw_close.py
 # Purpose:
-#   - Read symbols from transactions.xlsx
-#   - Normalize TW symbols (e.g., "2330" -> "2330.TW")
-#   - Download latest available Close/Adj Close via yfinance
+#   - Read transactions.xlsx -> extract Taiwan stock symbols
+#   - Fetch latest close price via FinMind
 #   - Save to prices_tw_close.csv
 #
-# Optional:
-#   - If Excel files do not exist, this script can restore them from base64 env vars:
-#       TX_XLSX_B64, FF_XLSX_B64
-#     (In GitHub Actions you usually restore in workflow already, but this is a safety net.)
+# Notes:
+#   - No yfinance dependency
+#   - Supports symbols like "2330" or "2330.TW" (we normalize to "2330")
 
 import os
-import sys
-import base64
-from pathlib import Path
-from datetime import datetime, timezone, timedelta
-
 import pandas as pd
-import numpy as np
-import yfinance as yf
+from datetime import datetime, timedelta, timezone
+
+from FinMind.data import DataLoader
 
 TX_FILE = "transactions.xlsx"
 OUT_CSV = "prices_tw_close.csv"
 
-# ---- If you want to support reading a second file later, keep it here (not required now)
-FUND_FILE = "Funds Flow.xlsx"
 
-# Environment keys for base64 restore (match workflow secrets)
-ENV_TX_B64 = "TX_XLSX_B64"
-ENV_FF_B64 = "FF_XLSX_B64"
-
-
-def log(msg: str):
-    print(msg, flush=True)
-
-
-def restore_excel_from_env_if_missing():
-    """
-    If transactions.xlsx (and/or Funds Flow.xlsx) is missing,
-    try to restore them from base64 in environment variables.
-    """
-    def write_b64(env_key: str, out_path: str):
-        b64 = os.environ.get(env_key, "").strip()
-        if not b64:
-            return False
-        try:
-            data = base64.b64decode(b64)
-            with open(out_path, "wb") as f:
-                f.write(data)
-            log(f"[OK] Restored {out_path} from {env_key} ({len(data):,} bytes)")
-            return True
-        except Exception as e:
-            log(f"[ERROR] Failed restoring {out_path} from {env_key}: {e}")
-            return False
-
-    tx_exists = Path(TX_FILE).exists()
-    ff_exists = Path(FUND_FILE).exists()
-
-    if not tx_exists:
-        log(f"[WARN] {TX_FILE} not found. Trying to restore from env: {ENV_TX_B64}")
-        write_b64(ENV_TX_B64, TX_FILE)
-
-    # Funds Flow isn't needed by this script, but many people want it restored too.
-    if not ff_exists:
-        log(f"[INFO] {FUND_FILE} not found. (Optional) Trying to restore from env: {ENV_FF_B64}")
-        write_b64(ENV_FF_B64, FUND_FILE)
-
-
-def normalize_symbol(sym: str) -> str:
-    """
-    Normalize symbol formats for yfinance.
-    - "2330" -> "2330.TW"
-    - keep "0050.TW" as is
-    - allow "^TWII" etc.
-    """
+def normalize_tw_symbol(sym: str) -> str:
     if sym is None:
         return ""
     s = str(sym).strip().upper().replace(":", ".")
-    if s == "" or s == "NAN" or s == "TOTAL":
+    if s in ("", "NAN", "TOTAL"):
         return ""
-
-    # If already contains a dot suffix (.TW/.TWO etc.) or starts with ^, keep it
-    if s.startswith("^"):
-        return s
-    if "." in s:
-        return s
-
-    # Pure digits -> assume TW stock
+    # 2330.TW -> 2330
+    if s.endswith(".TW"):
+        s = s[:-3]
+    # 2330.TWO -> 2330 (你如果有上櫃，FinMind一樣用純數字)
+    if s.endswith(".TWO"):
+        s = s[:-4]
+    # 只保留純數字
     if s.isdigit():
-        return f"{s}.TW"
+        return s
+    # 如果不是數字（例如ETF代碼也會是數字），其他就丟掉
+    return ""
 
-    # fallback: leave as-is
-    return s
 
-
-def load_symbols_from_transactions() -> list[str]:
-    if not Path(TX_FILE).exists():
-        log("")
-        log("[ERROR] transactions.xlsx not found.")
-        log("✅ 你需要把 transactions.xlsx 放在 repo 根目錄，或在 GitHub Actions 用 Secrets 還原。")
-        log("   - workflow 內應該先 Restore Excel files 再跑這支 script")
-        log(f"   - 或你可以在 Secrets 設定 {ENV_TX_B64}（base64）")
-        log("")
-        raise FileNotFoundError(TX_FILE)
+def load_symbols() -> list[str]:
+    if not os.path.exists(TX_FILE):
+        raise FileNotFoundError(f"Missing file: {TX_FILE}. (Did you restore Excel in workflow?)")
 
     df = pd.read_excel(TX_FILE)
 
-    # Try common column names
-    col_candidates = ["Stock Symbol", "Symbol", "symbol", "Ticker", "ticker"]
-    sym_col = None
-    for c in col_candidates:
+    # stock symbol column name might vary; try common names
+    possible_cols = ["Stock Symbol", "symbol", "Symbol", "Ticker"]
+    col = None
+    for c in possible_cols:
         if c in df.columns:
-            sym_col = c
+            col = c
             break
+    if col is None:
+        raise ValueError(f"Cannot find symbol column in {TX_FILE}. Columns={list(df.columns)}")
 
-    if sym_col is None:
-        raise ValueError(f"Cannot find symbol column in {TX_FILE}. Expected one of: {col_candidates}")
-
-    syms = df[sym_col].dropna().astype(str).tolist()
-    syms = [normalize_symbol(s) for s in syms]
-    syms = [s for s in syms if s]
-
-    # unique + stable order
-    seen = set()
-    out = []
-    for s in syms:
-        if s not in seen:
-            seen.add(s)
-            out.append(s)
-
-    if not out:
-        raise ValueError("No valid symbols found in transactions.xlsx")
-
-    return out
+    syms = df[col].dropna().map(normalize_tw_symbol)
+    syms = [s for s in syms.tolist() if s]
+    return sorted(set(syms))
 
 
-def download_latest_close(tickers: list[str]) -> pd.DataFrame:
+def finmind_last_close(symbol: str, api: DataLoader, start_date: str) -> tuple[str, float]:
     """
-    Download last ~10 trading days and pick latest available Close/Adj Close.
+    Return (date_str, close_price) for the latest available trading day.
     """
-    tickers = [t for t in tickers if t]
-    if not tickers:
-        return pd.DataFrame(columns=["symbol", "price", "date"])
+    data = api.taiwan_stock_daily(stock_id=symbol, start_date=start_date)
+    if data is None or data.empty:
+        raise ValueError(f"No FinMind data for {symbol}")
 
-    # yfinance can take space-joined tickers
-    data = yf.download(
-        tickers=" ".join(tickers),
-        period="15d",
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        group_by="column",
-    )
+    # FinMind columns typically include: date, close
+    data = data.dropna(subset=["date", "close"]).sort_values("date")
+    if data.empty:
+        raise ValueError(f"FinMind data has no close for {symbol}")
 
-    if data is None or len(data) == 0:
-        raise RuntimeError("yfinance returned empty data. (network issue or invalid tickers?)")
-
-    # Determine which price field we use
-    # Prefer Adj Close if it exists; otherwise Close
-    price_field = None
-    if isinstance(data.columns, pd.MultiIndex):
-        lvl0 = data.columns.get_level_values(0)
-        if "Adj Close" in lvl0:
-            price_field = "Adj Close"
-        elif "Close" in lvl0:
-            price_field = "Close"
-        else:
-            raise RuntimeError("yfinance data missing Close/Adj Close columns")
-        px = data[price_field].copy()
-    else:
-        # single ticker case: columns are normal
-        if "Adj Close" in data.columns:
-            price_field = "Adj Close"
-        elif "Close" in data.columns:
-            price_field = "Close"
-        else:
-            raise RuntimeError("yfinance data missing Close/Adj Close columns")
-        px = data[[price_field]].copy()
-        px.columns = [tickers[0]]
-
-    # Normalize index to date only
-    px.index = pd.to_datetime(px.index).tz_localize(None).normalize()
-    px = px.dropna(how="all")
-
-    if px.empty:
-        raise RuntimeError("All downloaded prices are NaN. Check tickers.")
-
-    # Latest available row
-    latest_date = px.index[-1]
-    latest_row = px.iloc[-1]
-
-    out = pd.DataFrame({"symbol": latest_row.index.astype(str), "price": latest_row.values})
-    out["date"] = pd.Timestamp(latest_date).strftime("%Y-%m-%d")
-    out["price"] = pd.to_numeric(out["price"], errors="coerce")
-
-    return out
+    last = data.iloc[-1]
+    return str(last["date"]), float(last["close"])
 
 
 def main():
-    log("=== update_prices_tw_close.py ===")
+    symbols = load_symbols()
+    if not symbols:
+        raise ValueError("No valid Taiwan stock symbols found in transactions.xlsx")
 
-    # Safety: restore Excel if missing (optional)
-    restore_excel_from_env_if_missing()
+    # GitHub runner is UTC; but TW market uses UTC+8.
+    tz_utc8 = timezone(timedelta(hours=8))
+    now_tw = datetime.now(tz_utc8)
 
-    # Load symbols
-    symbols = load_symbols_from_transactions()
-    log(f"[OK] Loaded {len(symbols)} symbols from {TX_FILE}")
+    # Get last ~30 days to ensure we have the latest close (avoid holidays)
+    start_date = (now_tw.date() - timedelta(days=30)).strftime("%Y-%m-%d")
 
-    # Download latest close
-    prices = download_latest_close(symbols)
+    api = DataLoader()
+    token = os.getenv("FINMIND_TOKEN", "").strip()
+    if token:
+        api.login_by_token(token)
 
-    # Report missing tickers
-    missing = prices[prices["price"].isna()]["symbol"].tolist()
-    ok = prices[prices["price"].notna()].copy()
+    rows = []
+    errors = []
 
-    # Save
-    ok = ok.sort_values("symbol")
-    ok.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
+    for sym in symbols:
+        try:
+            d, close = finmind_last_close(sym, api, start_date)
+            rows.append({"symbol": sym, "date": d, "close": close})
+        except Exception as e:
+            errors.append(f"{sym}: {e}")
 
-    log(f"[OK] Saved: {OUT_CSV} ({ok.shape[0]} tickers)")
+    out = pd.DataFrame(rows).sort_values(["symbol"])
+    out.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
 
-    if missing:
-        log("")
-        log("[WARN] Some tickers have no price (yfinance returned NaN). They were skipped:")
-        for m in missing:
-            log(f"  - {m}")
-
-    # Print a small preview
-    log("")
-    log("Preview:")
-    log(ok.head(10).to_string(index=False))
-
-    log("=== done ===")
+    print(f"Saved {OUT_CSV} with {len(out)} symbols.")
+    if errors:
+        print("Warnings (symbols failed):")
+        for msg in errors:
+            print(" -", msg)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        log("")
-        log("[FATAL] update_prices_tw_close.py failed.")
-        log(str(e))
-        # show file list for debugging in GitHub Actions
-        try:
-            log("\n[DEBUG] Files in workspace:")
-            for p in sorted(Path(".").glob("*")):
-                log(f" - {p.name}")
-        except Exception:
-            pass
-        sys.exit(1)
+    main()
