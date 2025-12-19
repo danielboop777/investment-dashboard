@@ -1,156 +1,174 @@
 # save_portfolio_chart_for_dashboard.py
-# Portfolio Value Trend (NO yfinance)
-# - Use FinMind for historical prices
-# - Use prices_tw_close.csv for latest close fallback
-# - Output:
-#     portfolio_chart.json
-#     portfolio_chart_div.html
+# Yahoo-style:
+#   Top = portfolio value (lines)
+#   Bottom = transaction count (bars)
+#
+# ✅ NO yfinance version: use FinMind for TW stock prices
 
-import os
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, timezone
-
-from FinMind.data import DataLoader
 import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.subplots import make_subplots
+from FinMind.data import DataLoader
 
-TX_FILE = "transactions.xlsx"
-PRICE_CSV = "prices_tw_close.csv"
+EXCEL_PATH = "transactions.xlsx"
+SHEET_NAME = 0
+COST_BASIS_IS_TOTAL = False
 
 OUT_JSON = "portfolio_chart.json"
 OUT_DIV = "portfolio_chart_div.html"
 
 
-# ---------- helpers ----------
-def normalize_symbol(sym: str) -> str:
-    s = str(sym).strip().upper()
-    if s.endswith(".TW"):
-        s = s[:-3]
-    if s.endswith(".TWO"):
-        s = s[:-4]
-    return s if s.isdigit() else ""
-
-
-def load_transactions():
-    df = pd.read_excel(TX_FILE)
+# =========================
+# Load transactions
+# =========================
+def load_transactions(path: str, sheet=SHEET_NAME) -> pd.DataFrame:
+    df = pd.read_excel(path, sheet_name=sheet)
 
     df = df.rename(columns={
-        "Buy Time": "buy",
-        "Sell Time": "sell",
+        "Buy Time": "buy_time",
+        "Sell Time": "sell_time",
         "Stock Symbol": "symbol",
         "# of Shares": "shares",
-        "Cost Basis": "cost",
+        "Cost Basis": "cost_basis",
         "Sell Price": "sell_price",
         "Status": "status",
     })
 
-    df["buy"] = pd.to_datetime(df["buy"], errors="coerce")
-    df["sell"] = pd.to_datetime(df["sell"], errors="coerce")
-    df["shares"] = pd.to_numeric(df["shares"], errors="coerce")
-    df["cost"] = pd.to_numeric(df["cost"], errors="coerce")
+    df["buy_time"] = pd.to_datetime(df["buy_time"], errors="coerce")
+    df["sell_time"] = pd.to_datetime(df["sell_time"], errors="coerce")
     df["sell_price"] = pd.to_numeric(df["sell_price"], errors="coerce")
+    df["shares"] = pd.to_numeric(df["shares"], errors="coerce")
+    df["cost_basis"] = pd.to_numeric(df["cost_basis"], errors="coerce")
 
-    df["symbol"] = df["symbol"].map(normalize_symbol)
-    df = df[df["symbol"] != ""]
+    # 你已經把 symbol 改成純數字了（2330、0050），這裡就保持乾淨
+    df["symbol"] = df["symbol"].astype(str).str.strip().str.upper().str.replace(":", ".", regex=False)
+
+    df = df.dropna(subset=["buy_time", "symbol", "shares", "cost_basis"])
     df = df[df["shares"] != 0]
 
-    df["status"] = df["status"].fillna("").str.lower()
-    df.loc[(df["status"] == "") & df["sell"].notna(), "status"] = "sold"
-    df.loc[(df["status"] == "") & df["sell"].isna(), "status"] = "hold"
+    df["status"] = df["status"].fillna("").str.lower().str.strip()
+    df.loc[df["status"].isin(["sold", "sell", "closed"]), "status"] = "sold"
+    df.loc[df["status"].isin(["hold", "holding", "open"]), "status"] = "hold"
+    df.loc[(df["status"] == "") & df["sell_time"].notna(), "status"] = "sold"
+    df.loc[(df["status"] == "") & df["sell_time"].isna(), "status"] = "hold"
+
+    df["cost_per_share"] = (
+        df["cost_basis"] / df["shares"]
+        if COST_BASIS_IS_TOTAL
+        else df["cost_basis"]
+    )
 
     return df
 
 
-def load_latest_prices():
-    if not os.path.exists(PRICE_CSV):
-        return {}
-    df = pd.read_csv(PRICE_CSV)
-    return dict(zip(df["symbol"].astype(str), df["close"].astype(float)))
+# =========================
+# Prices via FinMind
+# =========================
+def finmind_price_df(tickers, start, end) -> pd.DataFrame:
+    """
+    Return close prices DataFrame indexed by date (datetime64[ns]) columns=tickers
+    """
+    dl = DataLoader()
 
+    start_s = pd.Timestamp(start).strftime("%Y-%m-%d")
+    end_s = pd.Timestamp(end).strftime("%Y-%m-%d")
 
-def finmind_history(symbols, start_date):
-    api = DataLoader()
-    token = os.getenv("FINMIND_TOKEN", "").strip()
-    if token:
-        api.login_by_token(token)
+    out = {}
+    for t in sorted(set([str(x).strip() for x in tickers if str(x).strip()])):
+        # FinMind 台股 stock_id 一般就是 "2330", "0050"
+        try:
+            d = dl.taiwan_stock_daily(stock_id=t, start_date=start_s, end_date=end_s)
+        except Exception:
+            d = pd.DataFrame()
 
-    frames = []
-    for sym in symbols:
-        data = api.taiwan_stock_daily(stock_id=sym, start_date=start_date)
-        if data is None or data.empty:
+        if d is None or d.empty:
+            # 留空，後面會處理
             continue
-        frames.append(
-            data[["date", "close"]]
-            .assign(symbol=sym)
-        )
 
-    if not frames:
-        raise RuntimeError("No FinMind price data fetched.")
+        # 欄位通常包含 date / close
+        if "date" not in d.columns or "close" not in d.columns:
+            continue
 
-    px = pd.concat(frames)
-    px["date"] = pd.to_datetime(px["date"])
-    return px.pivot(index="date", columns="symbol", values="close").sort_index()
+        s = d[["date", "close"]].copy()
+        s["date"] = pd.to_datetime(s["date"], errors="coerce")
+        s["close"] = pd.to_numeric(s["close"], errors="coerce")
+        s = s.dropna(subset=["date", "close"]).sort_values("date")
+        if s.empty:
+            continue
+
+        out[t] = s.set_index("date")["close"]
+
+    if not out:
+        return pd.DataFrame()
+
+    px = pd.concat(out, axis=1)
+    px.index = pd.to_datetime(px.index.date)
+    px = px.sort_index()
+    return px
 
 
-# ---------- main ----------
-def main():
-    tx = load_transactions()
-    if tx.empty:
-        raise RuntimeError("No valid transactions found.")
-
-    symbols = sorted(tx["symbol"].unique().tolist())
-    start = tx["buy"].min().normalize()
-    today = datetime.now(timezone(timedelta(hours=8))).date()
-    start_date = start.strftime("%Y-%m-%d")
-
-    prices_hist = finmind_history(symbols, start_date)
-
-    dates = pd.date_range(start, today, freq="B")
-    prices_hist = prices_hist.reindex(dates).ffill()
-
-    latest_price_map = load_latest_prices()
-    for sym, px in latest_price_map.items():
-        if sym in prices_hist.columns:
-            prices_hist.loc[dates[-1], sym] = px
-
-    holdings = pd.DataFrame(0.0, index=dates, columns=prices_hist.columns)
+# =========================
+# Portfolio value
+# =========================
+def compute_portfolio_value(tx, prices, dates):
+    holdings = pd.DataFrame(0.0, index=dates, columns=prices.columns)
 
     for _, r in tx.iterrows():
-        buy = r["buy"].normalize()
-        sell = r["sell"].normalize() if pd.notna(r["sell"]) else None
-        sh = float(r["shares"])
+        buy = r["buy_time"].normalize()
+        sell = r["sell_time"].normalize() if pd.notna(r["sell_time"]) else None
+        end = sell - pd.Timedelta(days=1) if r["status"] == "sold" and sell is not None else dates[-1]
         sym = r["symbol"]
 
-        if r["status"] == "sold" and sell is not None:
-            end = sell - pd.Timedelta(days=1)
-        else:
-            end = dates[-1]
+        if sym in holdings.columns:
+            if buy <= dates[-1]:
+                holdings.loc[buy:end, sym] += float(r["shares"])
 
-        holdings.loc[buy:end, sym] += sh
+    return (holdings * prices).sum(axis=1)
 
-    portfolio_value = (holdings * prices_hist).sum(axis=1)
 
+# =========================
+# Gains
+# =========================
+def compute_realized_unrealized(tx, prices, dates):
     realized = pd.Series(0.0, index=dates)
     unrealized = pd.Series(0.0, index=dates)
 
     for _, r in tx.iterrows():
-        buy = r["buy"].normalize()
+        buy = r["buy_time"].normalize()
         sh = float(r["shares"])
-        cost = float(r["cost"])
+        cost = float(r["cost_per_share"])
         sym = r["symbol"]
 
-        if r["status"] == "sold" and pd.notna(r["sell"]) and pd.notna(r["sell_price"]):
-            sell = r["sell"].normalize()
-            pnl = sh * (float(r["sell_price"]) - cost)
-            realized.loc[sell:] += pnl
+        if r["status"] == "sold" and pd.notna(r["sell_time"]):
+            sell = r["sell_time"].normalize()
+            if pd.notna(r["sell_price"]):
+                realized.loc[sell:] += sh * (float(r["sell_price"]) - cost)
         else:
-            pnl_series = sh * (prices_hist[sym] - cost)
-            unrealized.loc[buy:] += pnl_series.loc[buy:]
+            if sym not in prices.columns:
+                continue
+            pnl = sh * (prices[sym] - cost)
+            unrealized.loc[buy:] += pnl.loc[buy:]
 
-    net = realized + unrealized
+    return realized, unrealized
 
+
+# =========================
+# Transactions
+# =========================
+def compute_transaction_counts(tx, dates):
+    events = pd.concat([
+        tx["buy_time"].dropna().dt.normalize(),
+        tx["sell_time"].dropna().dt.normalize(),
+    ])
+    return events.value_counts().reindex(dates, fill_value=0)
+
+
+# =========================
+# Figure
+# =========================
+def build_figure(dates, pv, rg, ug, net, txns):
     fig = make_subplots(
         rows=2, cols=1,
         shared_xaxes=True,
@@ -158,25 +176,95 @@ def main():
         vertical_spacing=0.03,
     )
 
-    fig.add_trace(go.Scatter(x=dates, y=portfolio_value, name="Portfolio Value"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=dates, y=net, name="Net Return"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=dates, y=realized, name="Realized", line=dict(dash="dot")), row=1, col=1)
-    fig.add_trace(go.Scatter(x=dates, y=unrealized, name="Unrealized", line=dict(dash="dot")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=pv, name="Portfolio Value", mode="lines"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=net, name="Net Return", mode="lines"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=rg, name="Realized Gain", mode="lines", line=dict(dash="dot")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=ug, name="Unrealized Gain", mode="lines", line=dict(dash="dot")), row=1, col=1)
+
+    fig.add_trace(go.Bar(
+        x=dates, y=txns,
+        name="Transactions",
+        marker_color="rgb(60,60,60)",
+    ), row=2, col=1)
 
     fig.update_layout(
         template="plotly_white",
         hovermode="x unified",
         height=720,
-        title=dict(text="Portfolio Value Trend", x=0.5),
-        legend=dict(orientation="h", x=0.5, xanchor="center", y=-0.22),
-        margin=dict(t=90, b=130, l=70, r=55),
+        title=dict(text="Portfolio Value Trend", x=0.5, y=0.995, xanchor="center"),
+        margin=dict(t=135, b=130, l=70, r=55),
+        legend=dict(orientation="h", x=0.5, y=-0.22, xanchor="center"),
     )
+
+    fig.update_yaxes(
+        title_text="Value",
+        tickprefix="$",
+        tickformat=",.0f",
+        autorange=True,
+        fixedrange=False,
+        row=1, col=1,
+    )
+
+    fig.update_yaxes(
+        title_text="# of Transactions",
+        rangemode="tozero",
+        row=2, col=1,
+    )
+
+    fig.update_xaxes(
+        title_text=None,
+        row=1, col=1,
+        rangeselector=dict(
+            y=1.18,
+            buttons=[
+                dict(count=1, label="1M", step="month", stepmode="backward"),
+                dict(count=3, label="3M", step="month", stepmode="backward"),
+                dict(count=6, label="6M", step="month", stepmode="backward"),
+                dict(count=1, label="YTD", step="year", stepmode="todate"),
+                dict(count=2, label="2Y", step="year", stepmode="backward"),
+                dict(count=3, label="3Y", step="year", stepmode="backward"),
+                dict(step="all", label="All"),
+            ],
+        ),
+    )
+
+    fig.update_xaxes(
+        title_text=None,
+        row=2, col=1,
+        rangeslider=dict(visible=True, thickness=0.1),
+    )
+
+    return fig
+
+
+# =========================
+# MAIN
+# =========================
+def main():
+    tx = load_transactions(EXCEL_PATH)
+
+    start = tx["buy_time"].min().normalize()
+    end = pd.Timestamp.today().normalize()
+    dates = pd.date_range(start, end, freq="B")
+
+    prices = finmind_price_df(tx["symbol"].tolist(), start, end)
+    if prices.empty:
+        raise RuntimeError("FinMind returned no prices. Check symbols in transactions.xlsx (should be like 2330 / 0050).")
+
+    prices = prices.reindex(dates).ffill()
+
+    pv = compute_portfolio_value(tx, prices, dates)
+    rg, ug = compute_realized_unrealized(tx, prices, dates)
+    net = rg + ug
+    txns = compute_transaction_counts(tx, dates)
+
+    fig = build_figure(dates, pv, rg, ug, net, txns)
 
     pio.write_json(fig, OUT_JSON)
     with open(OUT_DIV, "w", encoding="utf-8") as f:
         f.write(pio.to_html(fig, full_html=False, include_plotlyjs=False))
 
-    print("Saved:", OUT_JSON, OUT_DIV)
+    fig.show()
 
 
 if __name__ == "__main__":
