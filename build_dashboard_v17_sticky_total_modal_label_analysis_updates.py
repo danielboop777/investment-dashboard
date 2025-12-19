@@ -23,16 +23,65 @@ OUT_HTML = "dashboard.html"
 # -----------------------------
 # Price loader (STATIC)
 # -----------------------------
+
 def load_price_table():
-    if not Path(PRICE_FILE).exists():
+    """
+    Read prices_close.csv produced by update_prices_tw_close.py
+    Acceptable columns (either set is OK):
+      A) symbol, date, last, prev, chg_abs, chg_pct   (✅ current)
+      B) symbol, date, close, prev, chg_abs, chg_pct  (also ok)
+
+    Returns a DataFrame with normalized columns:
+      symbol, date, close, prev, chg_abs, chg_pct
+    """
+    import os
+    import pandas as pd
+    import numpy as np
+
+    if not os.path.exists(PRICE_FILE):
         raise FileNotFoundError(f"Missing {PRICE_FILE}")
 
     df = pd.read_csv(PRICE_FILE)
-    df["date"] = pd.to_datetime(df["date"])
-    df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df.columns = [c.strip().lower() for c in df.columns]
 
-    return df.dropna(subset=["date", "symbol", "close"])
+    # --- required: symbol ---
+    if "symbol" not in df.columns:
+        raise ValueError(f"{PRICE_FILE} missing column: symbol. Got: {list(df.columns)}")
+    df["symbol"] = df["symbol"].astype(str).str.strip().str.upper().str.replace(":", ".", regex=False)
+
+    # --- date column might be "date" or "asof" ---
+    if "date" not in df.columns:
+        if "asof" in df.columns:
+            df = df.rename(columns={"asof": "date"})
+        else:
+            # not fatal; still allow without date
+            df["date"] = pd.NaT
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+    # --- price column might be "close" or "last" ---
+    if "close" not in df.columns:
+        if "last" in df.columns:
+            df = df.rename(columns={"last": "close"})
+        else:
+            raise ValueError(f"{PRICE_FILE} missing close/last column. Got: {list(df.columns)}")
+
+    # --- normalize numeric fields ---
+    for col in ["close", "prev", "chg_abs", "chg_pct"]:
+        if col not in df.columns:
+            df[col] = np.nan
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # keep only columns we care
+    keep = ["symbol", "date", "close", "prev", "chg_abs", "chg_pct"]
+    df = df[keep].copy()
+
+    # if duplicates, keep latest by date if available
+    if df["date"].notna().any():
+        df = df.sort_values(["symbol", "date"]).drop_duplicates("symbol", keep="last")
+    else:
+        df = df.drop_duplicates("symbol", keep="last")
+
+    return df
 
 
 def build_price_map_last_prev(price_df: pd.DataFrame):
