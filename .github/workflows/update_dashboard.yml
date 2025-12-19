@@ -92,6 +92,12 @@ jobs:
         run: |
           python build_dashboard_v17_sticky_total_modal_label_analysis_updates.py
 
+
+      - name: Set index.html for GitHub Pages
+        run: |
+          cp dashboard.html index.html
+
+
       # ✅ Commit & push（push 前先 rebase）
       - name: Commit generated files
         run: |
