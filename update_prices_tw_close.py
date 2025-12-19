@@ -1,12 +1,11 @@
 # update_prices_tw_close.py
 # Generate: prices_close.csv
-# Columns: symbol,last,prev,chg_abs,chg_pct,asof
+# Columns: symbol,date,last,prev,chg_abs,chg_pct
 # ✅ NO yfinance: use FinMind
 
 import os
 import sys
 import pandas as pd
-import numpy as np
 from datetime import datetime, timezone, timedelta
 from FinMind.data import DataLoader
 
@@ -31,18 +30,13 @@ def load_symbols() -> list[str]:
         .tolist()
     )
 
-    # keep only non-empty and not TOTAL
     syms = [s for s in syms if s and s not in ["TOTAL", "NAN"]]
-
-    # 你目前已改成純數字：2330 / 0050
-    # 這裡就不自動加 .TW / .TWO，完全用 FinMind stock_id
-    syms = sorted(set(syms))
-    return syms
+    return sorted(set(syms))
 
 
-def finmind_last_two_closes(stock_id: str, start_date: str, end_date: str) -> tuple[float | None, float | None, str | None]:
+def finmind_last_two_closes(stock_id: str, start_date: str, end_date: str):
     """
-    Return (last_close, prev_close, last_date_str)
+    Return: (last_close, prev_close, last_date_str)
     """
     dl = DataLoader()
     try:
@@ -74,45 +68,34 @@ def main():
     if not symbols:
         raise RuntimeError("No symbols found in transactions.xlsx")
 
-    # 抓最近 20 天，確保能拿到兩個交易日 close
     end_date = now_utc8.strftime("%Y-%m-%d")
     start_date = (now_utc8 - timedelta(days=30)).strftime("%Y-%m-%d")
 
     rows = []
-    asof_any = None
-
     for sym in symbols:
         last, prev, last_date = finmind_last_two_closes(sym, start_date, end_date)
 
-        if last is None or prev is None:
-            chg_abs = None
-            chg_pct = None
-        else:
-            chg_abs = last - prev
-            chg_pct = (last / prev - 1.0) if prev != 0 else None
-
-        if last_date:
-            asof_any = asof_any or last_date
+        chg_abs = (last - prev) if (last is not None and prev is not None) else None
+        chg_pct = ((last / prev) - 1.0) if (last is not None and prev not in [None, 0]) else None
 
         rows.append({
             "symbol": sym,
+            "date": last_date,     # ✅ 這欄就是你 dashboard 期待的
             "last": last,
             "prev": prev,
             "chg_abs": chg_abs,
             "chg_pct": chg_pct,
-            "asof": last_date,
         })
 
     out = pd.DataFrame(rows)
-
-    # 讓缺值更乾淨（dashboard 會自己處理 NaN）
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
     out["last"] = pd.to_numeric(out["last"], errors="coerce")
     out["prev"] = pd.to_numeric(out["prev"], errors="coerce")
     out["chg_abs"] = pd.to_numeric(out["chg_abs"], errors="coerce")
     out["chg_pct"] = pd.to_numeric(out["chg_pct"], errors="coerce")
 
     out.to_csv(PRICE_FILE, index=False, encoding="utf-8")
-    print(f"[OK] Wrote {PRICE_FILE} ({len(out):,} rows). Example:")
+    print(f"[OK] Wrote {PRICE_FILE} ({len(out):,} rows)")
     print(out.head(5).to_string(index=False))
 
 
