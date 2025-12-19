@@ -69,6 +69,15 @@ jobs:
         run: |
           python update_prices_tw_close.py
 
+
+      - name: Verify prices_close.csv
+        run: |
+          ls -lah
+          test -f "prices_close.csv"
+          echo "===== prices_close.csv head ====="
+          head -n 5 prices_close.csv
+
+      
       # ✅ 產出兩個圖的 div/json
       - name: Build Portfolio Value chart
         run: |
